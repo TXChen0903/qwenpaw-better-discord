@@ -1,9 +1,9 @@
-# CoPaw Better Discord
+# qwenpaw-better-discord
 
-Enhanced Discord channel for [CoPaw](https://github.com/agentscope-ai/CoPaw) — replaces the built-in Discord channel with embed-based thinking threads, auto-rename, and richer formatting.
+Enhanced Discord channel for [qwenpaw](https://github.com/agentscope-ai/CoPaw) — replaces the built-in Discord channel with embed cards, auto-rename, table rendering, and dynamic slash commands.
 
 ![Version](https://img.shields.io/badge/version-25.0.0-blue)
-![CoPaw](https://img.shields.io/badge/CoPaw-compatible-green)
+![qwenpaw](https://img.shields.io/badge/qwenpaw-compatible-green)
 
 ## Features
 
@@ -13,64 +13,71 @@ Enhanced Discord channel for [CoPaw](https://github.com/agentscope-ai/CoPaw) —
 | 🟢 **Tool Output Embed** | Tool results as green embed cards; JSON auto-parsed into named fields |
 | 💜 **Thinking Embed** | Agent reasoning shown in purple embed cards, auto-truncated if too long |
 | 🧵 **Lazy Thread** | Thread created only on first tool/thinking event — pure text replies stay flat |
-| ✏️ **Auto-Rename** | Thread automatically renamed with a concise LLM-generated title after completion |
+| ✏️ **Auto-Rename** | Thread automatically renamed with a concise LLM-generated title (Chinese-aware) |
 | ⌨️ **Typing Indicator** | Persistent typing ping while the agent is processing |
+| 📊 **Table → Image** | Markdown tables automatically rendered as PNG images |
+| ⚡ **Slash Commands** | All built-in commands auto-registered as Discord slash commands |
+
+### Slash Commands
+
+All daemon, control, and conversation commands are dynamically discovered from qwenpaw registries and registered as Discord slash commands on every reconnect. When qwenpaw adds new commands in future releases, they appear automatically — no code changes needed.
+
+**Daemon:** `/status`, `/restart`, `/reload-config`, `/version`, `/logs` (with `lines` param), `/approve`
+**Control:** `/stop`, `/model` (and any future commands in `_COMMAND_REGISTRY`)
+**Conversation:** `/compact`, `/new`, `/clear`, `/history`, `/message`, `/dump_history`, `/load_history`, `/long_term_memory`, etc.
 
 ### Before vs After
 
 **Built-in DiscordChannel:**
 All tool calls, outputs, and thinking are rendered as raw markdown text in the main channel.
 
-**CoPaw Better Discord:**
-Each tool interaction becomes a color-coded embed card inside a dedicated thread. The main channel stays clean with only the final reply.
+**qwenpaw-better-discord:**
+Each tool interaction becomes a color-coded embed card inside a dedicated thread. The main channel stays clean with only the final reply. Slash commands work natively in Discord's command picker.
 
 ## Installation
 
 ### Prerequisites
 
-- [CoPaw](https://github.com/agentscope-ai/CoPaw) installed and running
-- Discord channel already configured and working in your CoPaw instance
+- [qwenpaw](https://github.com/agentscope-ai/CoPaw) installed and running
+- Discord channel already configured and working in your qwenpaw instance
 
 ### One-Line Install
 
 ```bash
-copaw channels install better_discord --url https://raw.githubusercontent.com/seal8809030/copaw-better-discord/main/better_discord.py
+copaw channels install better_discord --url https://raw.githubusercontent.com/seal8809030/qwenpaw-better-discord/main/better_discord.py
 ```
 
-That's it. Restart CoPaw and the enhanced Discord channel takes over automatically.
+Restart qwenpaw and the enhanced Discord channel takes over automatically.
 
 ### What Happens During Installation
 
-1. **Download** — CoPaw fetches `better_discord.py` from this repository
+1. **Download** — qwenpaw fetches `better_discord.py` from this repository
 2. **Save** — The file is written to `~/.copaw/custom_channels/better_discord.py`
-3. **Auto-Register** — On next startup, CoPaw scans `custom_channels/` and detects the `BetterDiscordChannel` class with `channel = "discord"`, which overrides the built-in `DiscordChannel`
+3. **Auto-Register** — On next startup, qwenpaw scans `custom_channels/` and detects the `BetterDiscordChannel` class with `channel = "discord"`, which overrides the built-in `DiscordChannel`
 4. **No config changes needed** — No manual editing of `config.json` required
 
 ### Update
 
-Re-run the same install command to overwrite with the latest version:
-
 ```bash
-copaw channels install better_discord --url https://raw.githubusercontent.com/seal8809030/copaw-better-discord/main/better_discord.py
+copaw channels install better_discord --url https://raw.githubusercontent.com/seal8809030/qwenpaw-better-discord/main/better_discord.py
 ```
 
-Then restart CoPaw.
+Then restart qwenpaw.
 
 ### Uninstall
 
 ```bash
-# Remove the custom channel file
 rm ~/.copaw/custom_channels/better_discord.py
 ```
 
-Restart CoPaw to fall back to the built-in Discord channel.
+Restart qwenpaw to fall back to the built-in Discord channel.
 
 ## How It Works
 
 ### Message Flow
 
 ```
-User sends message
+User sends message (or slash command)
   ↓
 Agent starts processing
   ├─ Pure text reply → Sent directly in channel (no thread)
@@ -123,16 +130,21 @@ Agent starts processing
 
 ### Thread Auto-Rename
 
-After the agent finishes responding, the thread (initially named "Thinking~") is automatically renamed to a concise title generated by the agent's LLM. The title language adapts to the user's message language.
+After the agent finishes responding, the thread (initially named "Thinking~") is automatically renamed to a concise title generated by the agent's LLM. The title language adapts to the user's message language, with explicit Traditional/Simplified Chinese detection.
 
 Examples:
 - User asks in English → `Weather Forecast`
-- User asks in Chinese → `新竹天氣查詢`
+- User asks in Traditional Chinese → `新竹天氣查詢`
+- User asks in Simplified Chinese → `新竹天气查询`
 - User asks in Japanese → `天気予報`
+
+### Table Rendering
+
+When the agent replies with markdown tables, they are automatically detected and rendered as PNG images before sending to Discord. This produces much cleaner output than raw markdown tables in Discord messages.
 
 ## Configuration
 
-All settings can be customized through the `BetterDiscordChannel` constructor. Edit the defaults in `better_discord.py` or pass kwargs via your CoPaw config:
+All settings can be customized through the `BetterDiscordChannel` constructor. Edit the defaults in `better_discord.py` or pass kwargs via your qwenpaw config:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -149,35 +161,51 @@ All settings can be customized through the `BetterDiscordChannel` constructor. E
 ## Architecture
 
 ```
-better_discord.py (single file, ~575 lines)
-├── Data Extraction Helpers
-│   ├── _extract_text_from_content()  — Extract text from str/list/dict
-│   ├── _unwrap_content()             — Unwrap content wrappers to dict
-│   └── _extract_tool_info()          — Extract name/payload/call_id
-├── Embed Formatting
-│   ├── _payload_to_fields()          — Output payload → embed fields
-│   ├── _payload_to_call_fields()     — Call args → embed fields
-│   └── _truncate()                   — Safe text truncation
+better_discord.py (~680 lines)
+├── Content Helpers
+│   ├── _extract_text()     — Extract text from str/list/dict
+│   ├── _unwrap()           — Unwrap content wrappers to dict
+│   └── _tool_info()        — Extract name/payload/call_id
+├── Formatting Helpers
+│   ├── _to_fields()        — Output payload → embed fields
+│   ├── _call_fields()      — Call args → embed fields
+│   ├── _trunc()            — Safe text truncation
+│   └── _parse_json()       — JSON parse with code-fence handling
 └── BetterDiscordChannel(DiscordChannel)
+    ├── Factory Methods
+    │   ├── from_env()             — Create from environment variables
+    │   └── from_config()          — Create from config dict/model
+    ├── Send Override
+    │   └── send()                 — Routes slash replies via followup
+    ├── Table Rendering
+    │   └── send_content_parts()   — Detects tables, renders PNG, replaces
     ├── Lifecycle Hooks
     │   ├── _before_consume_process()  — Start typing, capture user text
-    │   └── _on_process_completed()    — Stop typing, trigger rename
+    │   ├── _on_process_completed()    — Stop typing, trigger rename, cleanup
+    │   └── _on_consume_error()        — Stop typing, cleanup
     ├── Thread Management
-    │   ├── _ensure_thread()           — Lazy thread creation
-    │   └── _rename_thread()           — LLM-generated title rename
+    │   ├── _ensure_thread()       — Lazy thread creation
+    │   ├── _send_to_thread()      — Send embed/text to thread
+    │   ├── _generate_thread_title() — LLM-based title generation
+    │   └── _rename_thread()       — Apply title via Discord API
+    ├── Slash Commands
+    │   ├── _register_slash_commands() — Auto-discover & register all commands
+    │   └── _dispatch_slash()          — Enqueue slash cmd as native payload
     ├── Event Interception
     │   └── on_event_message_completed() — Route events to embed builders
     └── Embed Builders
-        ├── _build_call_embed()        — Blue embed for tool calls
-        ├── _build_output_embed()      — Green embed for tool outputs
-        └── _build_thinking_embed()    — Purple embed for reasoning
+        ├── _build_embed()          — Dispatch by message type
+        ├── _build_call_embed()     — Blue embed for tool calls
+        ├── _build_output_embed()   — Green embed for tool outputs
+        ├── _build_thinking_embed() — Purple embed for reasoning
+        └── _build_fallback_text()  — Plain-text fallback
 ```
 
 ## Compatibility
 
-- **CoPaw**: Compatible with current versions that support `custom_channels/` loading
-- **Discord.py**: Uses the same `discord.py` version bundled with CoPaw
-- **Python**: No additional dependencies required — all imports come from CoPaw itself
+- **qwenpaw**: Compatible with current versions that support `custom_channels/` loading
+- **Discord.py**: Uses the same `discord.py` version bundled with qwenpaw
+- **Python**: Requires `table_renderer` package (for table → image rendering)
 
 ## Troubleshooting
 
@@ -185,7 +213,13 @@ better_discord.py (single file, ~575 lines)
 
 1. Verify the file exists: `ls ~/.copaw/custom_channels/better_discord.py`
 2. Clear Python cache: `rm -rf ~/.copaw/custom_channels/__pycache__`
-3. Restart CoPaw
+3. Restart qwenpaw
+
+### Slash commands not appearing
+
+1. Check `~/.copaw/qwenpaw.log` for registration errors
+2. The bot needs `applications.commands` scope when invited to the server
+3. Commands sync on every `on_ready` event — a simple reconnect is enough
 
 ### Thread not auto-renaming
 
@@ -194,8 +228,8 @@ better_discord.py (single file, ~575 lines)
 
 ### Falling back to built-in behavior
 
-- If `better_discord.py` fails to import (syntax error, missing dependency), CoPaw logs a warning and falls back to the built-in `DiscordChannel`
-- Check CoPaw logs for `failed to load custom channel: better_discord`
+- If `better_discord.py` fails to import (syntax error, missing dependency), qwenpaw logs a warning and falls back to the built-in `DiscordChannel`
+- Check qwenpaw logs for `failed to load custom channel: better_discord`
 
 ## License
 
