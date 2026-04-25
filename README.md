@@ -44,7 +44,7 @@ Each tool interaction becomes a color-coded embed card inside a dedicated thread
 ### One-Line Install
 
 ```bash
-copaw channels install better_discord --url https://raw.githubusercontent.com/seal8809030/qwenpaw-better-discord/main/better_discord.py
+copaw channels install better_discord --url https://raw.githubusercontent.com/TXChen0903/qwenpaw-better-discord/main/better_discord.py
 ```
 
 Restart qwenpaw and the enhanced Discord channel takes over automatically.
@@ -59,7 +59,7 @@ Restart qwenpaw and the enhanced Discord channel takes over automatically.
 ### Update
 
 ```bash
-copaw channels install better_discord --url https://raw.githubusercontent.com/seal8809030/qwenpaw-better-discord/main/better_discord.py
+copaw channels install better_discord --url https://raw.githubusercontent.com/TXChen0903/qwenpaw-better-discord/main/better_discord.py
 ```
 
 Then restart qwenpaw.
