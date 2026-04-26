@@ -31,7 +31,7 @@ from table_renderer import extract_tables, get_renderer
 
 logger = logging.getLogger("copaw.better_discord")
 
-__version__ = "25.0.0"
+__version__ = "25.1.0"
 
 _CALL_TYPES = frozenset({
     MessageType.FUNCTION_CALL,
@@ -172,35 +172,112 @@ def _to_fields(payload: Any, max_val: int = 900) -> dict[str, str] | None:
             )
             for k, v in payload.items()
         }
-    if isinstance(payload, list):
-        return {"result": json.dumps(payload, ensure_ascii=False, indent=2)}
     return {"result": str(payload)}
 
 
-# ── channel ─────────────────────────────────────────────────────────────────
+def _chunk_text(text: str, limit: int = 1900) -> list[str]:
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 <= limit:
+            current = (current + "\n" + line) if current else line
+        else:
+            if current:
+                chunks.append(current)
+            if len(line) <= limit:
+                current = line
+            else:
+                while len(line) > limit:
+                    chunks.append(line[:limit])
+                    line = line[limit:]
+                current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _strip_md_images(text: str) -> str:
+    return re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)
+
+
+def _html_to_text(html: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return text
+
+
+def _strip_xml(text: str) -> str:
+    if "<" not in text:
+        return text
+    text = _strip_md_images(text)
+    text = re.sub(r"<(?:thinking|search)[^>]*>.*?</(?:thinking|search)>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<(?:results|result|source|evidence|snippet)[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</(?:results|result|source|evidence|snippet)>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<question>(.*?)</question>", r"Q: \1", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<answer>(.*?)</answer>", r"A: \1", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</?[^>]+>", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _safe(text: str, max_len: int = 1800) -> str:
+    text = _strip_xml(text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text[:max_len] + "\n… (truncated)" if len(text) > max_len else text
+
+
+# ── main class ──────────────────────────────────────────────────────────────
 
 class BetterDiscordChannel(DiscordChannel):
+    """Enhanced Discord channel with embed cards, typing indicator, and thread management."""
 
-    channel = "discord"
-    _typing_tasks: dict[str, asyncio.Task] = {}
+    # ── defaults ────────────────────────────────────────────────────────────
+    color_call = 0x5865F2
+    color_output = 0x57F287
+    color_thinking = 0xFEE75C
+    color_help = 0xED4245
+    color_model = 0xEB459E
+    color_memory = 0x2B2D31
+    max_field_len = 900
+    max_output_len = 1800
+    max_call_arg_len = 1200
+    embed_arg_len = 800
+    show_tool_details = True
+    filter_tool_messages = False
+    filter_thinking = False
+    thread_auto_archive = 1440
+    thread_name = "💬 thinking..."
+    typing_interval = 8
+    rename_model = ""
+    workspace_dir: Path | None = None
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self.color_call: int     = kwargs.pop("embed_color_call", 0x60A5FA)
-        self.color_output: int   = kwargs.pop("embed_color_output", 0x34D399)
-        self.color_thinking: int = kwargs.pop("embed_color_thinking", 0x818CF8)
-        self.thread_name: str    = kwargs.pop("thread_name", "Thinking~")
-        self.thread_auto_archive: int = kwargs.pop("thread_auto_archive", 60)
-        self.max_field_len: int  = kwargs.pop("max_embed_field_len", 900)
-        self.max_output_len: int = kwargs.pop("max_output_text_len", 1800)
-        self.max_call_arg_len: int = kwargs.pop("max_call_arg_len", 150)
-        self.typing_interval: int  = kwargs.pop("typing_interval", 8)
-
-        super().__init__(*args, **kwargs)
-
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # Only override self._client if explicitly provided in kwargs;
+        # otherwise keep the one created by parent DiscordChannel.__init__.
+        if "client" in kwargs or "bot" in kwargs:
+            bot = kwargs.get("bot")
+            self._client = kwargs.get("client", bot) or bot
+        self.show_tool_details = kwargs.get("show_tool_details", True)
+        self.filter_tool_messages = kwargs.get("filter_tool_messages", False)
+        self.filter_thinking = kwargs.get("filter_thinking", False)
+        self.thread_auto_archive = kwargs.get("thread_auto_archive", 1440)
+        self.typing_interval = kwargs.get("typing_interval", 8)
+        self.rename_model = kwargs.get("rename_model", "")
+        self.workspace_dir = kwargs.get("workspace_dir")
+        self._typing_tasks: dict[str, asyncio.Task] = {}
         self._active_thread_id: str | None = None
         self._active_channel_id: str | None = None
         self._active_user_text: str | None = None
         self._active_reply_text: str | None = None
+        # ── [CHANGE 1] native reply tracking ────────────────────────────
+        self._active_trigger_msg_id: str | None = None
+        self._is_final_reply: bool = False
+        # ── slash command tracking ──────────────────────────────────────
         self._pending_slash: dict[str, discord.Interaction] = {}
         self._slash_started: dict[str, float] = {}
 
@@ -269,7 +346,7 @@ class BetterDiscordChannel(DiscordChannel):
             accept_bot_messages=c.get("accept_bot_messages", False),
         )
 
-    # ── send with slash followup routing ────────────────────────────────────
+    # ── [CHANGE 6] send with slash followup + native reply routing ──────────
 
     async def send(self, to_handle: str, text: str, meta: dict | None = None) -> None:
         cid = (meta or {}).get("channel_id")
@@ -278,6 +355,7 @@ class BetterDiscordChannel(DiscordChannel):
             cid = route.get("channel_id") or None
         interaction = self._pending_slash.get(cid) if cid else None
 
+        # ── Slash command → followup (exclude from native reply) ───────
         if interaction is not None and _time.time() - self._slash_started.get(cid, 0) < 800:
             try:
                 for chunk in self._chunk_text(text):
@@ -290,6 +368,27 @@ class BetterDiscordChannel(DiscordChannel):
                 self._pending_slash.pop(cid, None)
                 self._slash_started.pop(cid, None)
 
+        # ── Native reply to trigger message ────────────────────────────
+        if self._is_final_reply and self._active_trigger_msg_id and cid:
+            chunks = list(self._chunk_text(text))
+            if chunks:
+                replied = await self._try_reply(cid, self._active_trigger_msg_id, chunks[0])
+                if replied:
+                    self._is_final_reply = False
+                    self._active_trigger_msg_id = None
+                    # Send remaining chunks as normal channel messages
+                    for chunk in chunks[1:]:
+                        try:
+                            ch = self._client.get_channel(int(cid))
+                            if ch is None:
+                                ch = await self._client.fetch_channel(int(cid))
+                            await ch.send(chunk)
+                        except Exception:
+                            logger.warning("Failed to send follow-up chunk to channel %s", cid, exc_info=True)
+                    return
+                # _try_reply returned False → fall through to super()
+
+        self._is_final_reply = False
         await super().send(to_handle, text, meta)
 
     # ── table temp cleanup ──────────────────────────────────────────────────
@@ -362,6 +461,11 @@ class BetterDiscordChannel(DiscordChannel):
         if cid:
             self._active_channel_id = cid
             self._start_typing(cid)
+        # ── [CHANGE 2] capture trigger message_id for native reply ─────
+        meta = getattr(request, "channel_meta", {}) or {}
+        mid = meta.get("message_id")
+        if mid:
+            self._active_trigger_msg_id = str(mid)
         for msg in reversed(getattr(request, "input", None) or []):
             if getattr(msg, "role", None) == "user":
                 self._active_user_text = _extract_text(getattr(msg, "content", ""))
@@ -375,6 +479,9 @@ class BetterDiscordChannel(DiscordChannel):
                                                      self._active_reply_text or ""))
         self._active_thread_id = self._active_channel_id = None
         self._active_user_text = self._active_reply_text = None
+        # ── [CHANGE 3a] reset native reply state ───────────────────────
+        self._active_trigger_msg_id = None
+        self._is_final_reply = False
         cid = self._get_channel_id(request)
         if cid:
             self._pending_slash.pop(cid, None)
@@ -385,6 +492,9 @@ class BetterDiscordChannel(DiscordChannel):
         self._stop_typing(self._active_channel_id)
         self._active_thread_id = self._active_channel_id = None
         self._active_user_text = self._active_reply_text = None
+        # ── [CHANGE 3b] reset native reply state ───────────────────────
+        self._active_trigger_msg_id = None
+        self._is_final_reply = False
         cid = self._get_channel_id(request)
         if cid:
             self._pending_slash.pop(cid, None)
@@ -420,7 +530,33 @@ class BetterDiscordChannel(DiscordChannel):
         if task and not task.done():
             task.cancel()
 
-    # ── event interception ──────────────────────────────────────────────────
+    # ── [CHANGE 4] native reply helper ──────────────────────────────────────
+
+    async def _try_reply(self, channel_id: str, message_id: str, text: str) -> bool:
+        """Attempt a native Discord reply to *message_id*.
+
+        Returns True on success; on any failure (message deleted, no
+        permission, etc.) returns False so the caller can fall back to
+        ``super().send()``.
+        """
+        try:
+            ch = self._client.get_channel(int(channel_id))
+            if ch is None:
+                ch = await self._client.fetch_channel(int(channel_id))
+            msg = await ch.fetch_message(int(message_id))
+            await msg.reply(text)
+            return True
+        except discord.NotFound:
+            logger.debug("Message %s not found for native reply", message_id)
+            return False
+        except discord.Forbidden:
+            logger.debug("No permission to reply to message %s", message_id)
+            return False
+        except Exception:
+            logger.debug("Native reply failed for %s, falling back", message_id, exc_info=True)
+            return False
+
+    # ── [CHANGE 5] event interception with is_final_reply injection ─────────
 
     async def on_event_message_completed(self, request: Any, to_handle: str,
                                          event: Any, send_meta: dict[str, Any]) -> None:
@@ -431,6 +567,8 @@ class BetterDiscordChannel(DiscordChannel):
             text = _extract_text(event_content)
             if text:
                 self._active_reply_text = text
+            # ── inject is_final_reply flag for send() ──────────────────
+            self._is_final_reply = True
             return await super().on_event_message_completed(request, to_handle, event, send_meta)
 
         if msg_type not in _TOOL_TYPES and msg_type != MessageType.REASONING:
@@ -498,6 +636,27 @@ class BetterDiscordChannel(DiscordChannel):
             if orig is not None:
                 model.stream = orig
         content = resp.get("content") if hasattr(resp, "get") else getattr(resp, "content", "")
+        title = re.sub(r"[\n\"'*`]", " ", _extract_text(content)).strip()[:50] or None
+        logger.info("Generated thread title: %s", title)
+        return title
+
+    async def _schedule_thread_title(self, cid: str, mid: str, user_text: str, reply_text: str) -> None:
+        title = await self._generate_thread_title(user_text, reply_text)
+        if not title:
+            return
+        try:
+            channel = self._client.get_channel(int(cid)) or await self._client.fetch_channel(int(cid))
+            msg = await channel.fetch_message(int(mid))
+            thread = msg.thread
+            if not thread:
+                thread = await msg.create_thread(name=title, auto_archive_duration=self.thread_auto_archive)
+            else:
+                await thread.edit(name=title)
+            logger.info("Thread title → %s", title)
+        except Exception:
+            logger.debug("Failed to set thread title in channel %s", cid, exc_info=True)
+
+    def _extract_invoke_input(self, content: Any) -> str | None:
         if isinstance(content, list):
             content = "".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
         return re.sub(r"\s+", " ", str(content or "").strip())[:100].strip() or None
@@ -544,8 +703,9 @@ class BetterDiscordChannel(DiscordChannel):
                         continue
                     _seen.add(sub)
 
-                    async def _logs(interaction: discord.Interaction, lines: int = 100) -> None:
-                        await self._dispatch_slash(interaction, f"/logs {max(1, min(lines, 2000))}")
+                    async def _logs(interaction: discord.Interaction, args: str = "") -> None:
+                        # a bit more flexible with lines
+                        await self._dispatch_slash(interaction, f"/logs {args}")
                     tree.command(name="logs", description="Tail recent log lines")(_logs)
                 else:
                     _register(sub, f"Execute /{sub}")
@@ -564,7 +724,9 @@ class BetterDiscordChannel(DiscordChannel):
         try:
             from copaw.agents.command_handler import CommandHandler
             for cmd in sorted(CommandHandler.SYSTEM_COMMANDS):
-                _register(cmd, f"Execute /{cmd}")
+                if cmd not in _seen:
+                    _seen.add(cmd)
+                    tree.command(name=cmd, description=f"Execute /{cmd}")(_handler(cmd))
         except Exception as e:
             logger.warning("Conversation slash commands: %s", e)
 
@@ -618,9 +780,7 @@ class BetterDiscordChannel(DiscordChannel):
     def _build_call_embed(self, content: Any) -> discord.Embed:
         name, payload, _ = _tool_info(content, is_output=False)
         embed = discord.Embed(title=f"⚡ {name or 'unknown'}", color=self.color_call)
-        if payload is not None:
-            for k, v in self._call_fields(payload).items():
-                embed.add_field(name=k, value=_trunc(v, self.max_field_len), inline=True)
+        self._add_call_fields(embed, payload)
         return embed
 
     def _build_output_embed(self, content: Any) -> discord.Embed | None:
@@ -658,19 +818,33 @@ class BetterDiscordChannel(DiscordChannel):
         if msg_type in _OUTPUT_TYPES:
             return f"✅ **{label}**\n{_trunc(text, self.max_output_len)}"
         if msg_type == MessageType.REASONING:
-            text = _extract_text(getattr(event, "content", "")).strip()
-            return f"💭 **Thinking**\n{_trunc(text, self.max_output_len)}"
+            return f"💭 **thinking**\n{_trunc(text, self.max_output_len)}"
         return ""
 
-    def _call_fields(self, payload: Any) -> dict[str, str]:
+    def _add_call_fields(self, embed: discord.Embed, payload: Any) -> None:
+        if payload is None:
+            return
         if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except (json.JSONDecodeError, TypeError):
-                return {"args": payload}
-        if isinstance(payload, dict) and payload:
-            return {k: v if isinstance(v, str) else json.dumps(v, ensure_ascii=False) for k, v in payload.items()}
-        return {}
+            obj = _parse_json(payload)
+            if obj and isinstance(obj, dict):
+                return self._add_call_fields(embed, obj)
+            return embed.add_field(name="args", value=_trunc(payload, self.max_field_len), inline=True)
+        if isinstance(payload, (list, tuple)):
+            texts = [str(getattr(i, "text", None) or (i.get("text") if isinstance(i, dict) else None) or "")
+                     for i in payload]
+            texts = [t for t in texts if t]
+            if not texts:
+                return
+            if len(texts) == 1:
+                obj = _parse_json(texts[0])
+                return self._add_call_fields(embed, obj) if obj and isinstance(obj, dict) else embed.add_field(name="args", value=_trunc(texts[0], self.max_field_len), inline=True)
+            return embed.add_field(name="args", value=_trunc(json.dumps(texts, ensure_ascii=False), self.max_field_len), inline=True)
+        if isinstance(payload, dict):
+            if len(payload) > 10:
+                return embed.add_field(name="args", value=_trunc(json.dumps(payload, ensure_ascii=False, indent=2), self.max_field_len), inline=True)
+            for k, v in payload.items():
+                embed.add_field(name=k, value=_trunc(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False), self.max_field_len), inline=True)
+        return
 
     @staticmethod
     def _get_channel_id(request: Any) -> str | None:
